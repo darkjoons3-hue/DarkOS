@@ -1,4 +1,4 @@
-#define PORT 0x3F8
+ #define PORT 0x3F8
 #define MAX_CMD_LEN 256
 
 unsigned char kbd_us[128] = {
@@ -11,10 +11,11 @@ unsigned char kbd_us[128] = {
 char cmd_buffer[MAX_CMD_LEN] = {0};
 int cmd_length = 0;
 
-void* memcpy(void* dest, const void* src, unsigned int n) {
-    unsigned char* d = dest; const unsigned char* s = src;
-    while (n--) *d++ = *s++; return dest;
-}
+// Глобальные буферы (чтобы не переполнять стек)
+unsigned char sector_buf[512];
+unsigned char dir_buf[512];
+unsigned char file_buf[512];
+
 void* memset(void* s, int c, unsigned int n) {
     unsigned char* p = s; while (n--) *p++ = (unsigned char)c; return s;
 }
@@ -24,17 +25,38 @@ static inline unsigned char inb(unsigned short port) { unsigned char ret; __asm_
 static inline unsigned short inw(unsigned short port) { unsigned short ret; __asm__ volatile ( "inw %1, %0" : "=a"(ret) : "Nd"(port) ); return ret; }
 
 void print_char(char c) { outb(PORT, c); }
-void print_string(const char* str) { for (int i = 0; str[i] != '\0'; i++) print_char(str[i]); }
+
+void print_string(const char* str) {
+    while (*str) { print_char(*str); str++; }
+}
+
+void print_int(unsigned int num) {
+    if (num == 0) { print_char('0'); return; }
+    char buf[12]; int len = 0;
+    while (num > 0) { buf[len++] = (num % 10) + '0'; num /= 10; }
+    while (len > 0) { print_char(buf[--len]); }
+}
 
 // --- Драйвер ATA ---
 void read_sector_ata(unsigned int lba, unsigned char* buffer) {
     outb(0x1F6, 0xE0 | ((lba >> 24) & 0x0F));
+    int timeout = 100000;
+    while ((inb(0x1F7) & 0x80) && timeout--);
+    if (timeout <= 0) return;
+
     outb(0x1F2, 1);
     outb(0x1F3, (unsigned char)lba);
     outb(0x1F4, (unsigned char)(lba >> 8));
     outb(0x1F5, (unsigned char)(lba >> 16));
     outb(0x1F7, 0x20);
-    while ((inb(0x1F7) & 0x08) == 0) { }
+
+    timeout = 100000;
+    while (1) {
+        unsigned char status = inb(0x1F7);
+        if (!(status & 0x80) && (status & 0x08)) break;
+        if (timeout-- <= 0) return;
+    }
+
     for (int i = 0; i < 256; i++) {
         unsigned short data = inw(0x1F0);
         buffer[i * 2] = (unsigned char)(data & 0xFF);
@@ -42,20 +64,29 @@ void read_sector_ata(unsigned int lba, unsigned char* buffer) {
     }
 }
 
-// --- Структура BPB для FAT32 ---
+// --- Структуры FAT32 ---
 struct fat32_bpb {
-    unsigned char jmp[3];
-    unsigned char oem[8];
-    unsigned short bytes_per_sector;
-    unsigned char sectors_per_cluster;
-    unsigned short reserved_sectors;
-    unsigned char num_fats;
-    // ... остальные поля пропущены для краткости
-    unsigned int fat_size_32;       // Смещение 36
-    unsigned int root_cluster;      // Смещение 44
-    unsigned char fs_type[8];       // Смещение 82 (должно быть "FAT32   ")
+    unsigned char jmp[3]; unsigned char oem[8]; unsigned short bytes_per_sector;
+    unsigned char sectors_per_cluster; unsigned short reserved_sectors;
+    unsigned char num_fats; unsigned short root_entries; unsigned short total_sectors_16;
+    unsigned char media_descriptor; unsigned short fat_size_16; unsigned short sectors_per_track;
+    unsigned short num_heads; unsigned int hidden_sectors; unsigned int total_sectors_32;
+    unsigned int fat_size_32; unsigned short ext_flags; unsigned short fs_version;
+    unsigned int root_cluster; unsigned short fs_info; unsigned short backup_boot_sector;
+    unsigned char reserved[12]; unsigned char drive_number; unsigned char reserved1;
+    unsigned char boot_signature; unsigned int volume_id; unsigned char volume_label[11];
+    unsigned char fs_type[8];
 } __attribute__((packed));
 
+struct dir_entry {
+    unsigned char name[8]; unsigned char ext[3]; unsigned char attributes;
+    unsigned char reserved; unsigned char creation_time_tenth; unsigned short creation_time;
+    unsigned short creation_date; unsigned short last_access_date; unsigned short high_cluster;
+    unsigned short write_time; unsigned short write_date; unsigned short low_cluster;
+    unsigned int file_size;
+} __attribute__((packed));
+
+// --- IDT и PIC ---
 struct idt_entry { unsigned short base_lo; unsigned short sel; unsigned char always0; unsigned char flags; unsigned short base_hi; } __attribute__((packed));
 struct idt_ptr { unsigned short limit; unsigned int base; } __attribute__((packed));
 struct idt_entry idt[256]; struct idt_ptr idtp;
@@ -77,30 +108,47 @@ void init_pic() {
     outb(0x21, 0xFD); outb(0xA1, 0xFF);
 }
 
-int is_help(const char* s) { return (s[0]=='h' && s[1]=='e' && s[2]=='l' && s[3]=='p' && s[4]=='\0'); }
-int is_fat(const char* s) { return (s[0]=='f' && s[1]=='a' && s[2]=='t' && s[3]=='\0'); }
+int is_cat(const char* s) { return (s[0]=='c' && s[1]=='a' && s[2]=='t' && s[3]=='\0'); }
 
-// --- Функция разбора FAT32 ---
-void check_fat32() {
-    unsigned char sector[512];
-    read_sector_ata(0, sector); // Читаем загрузочный сектор (LBA 0)
+void read_file_cat() {
+    print_string("Reading disk...\r\n");
+    read_sector_ata(0, sector_buf);
+    struct fat32_bpb* bpb = (struct fat32_bpb*)sector_buf;
 
-    // Приводим байты к структуре BPB
-    struct fat32_bpb* bpb = (struct fat32_bpb*)sector;
-
-    print_string("Checking File System...\r\n");
-    print_string("OEM Name: ");
-    for (int i = 0; i < 8; i++) print_char(bpb->oem[i]);
+    print_string("FS: ");
+    for(int i=0; i<8; i++) print_char(bpb->fs_type[i]);
     print_string("\r\n");
 
-    print_string("Bytes per sector: ");
-    print_char((bpb->bytes_per_sector >> 8) + '0'); // Очень грубый вывод числа
-    print_char((bpb->bytes_per_sector & 0xFF) + '0'); 
-    print_string("\r\n");
+    unsigned int root_dir_lba = bpb->reserved_sectors + (bpb->num_fats * bpb->fat_size_32);
+    if (bpb->root_cluster > 2) {
+        root_dir_lba += (bpb->root_cluster - 2) * bpb->sectors_per_cluster;
+    }
 
-    print_string("File System Type: ");
-    for (int i = 0; i < 8; i++) print_char(bpb->fs_type[i]);
-    print_string("\r\n");
+    read_sector_ata(root_dir_lba, dir_buf);
+    struct dir_entry* entry = (struct dir_entry*)dir_buf;
+
+    for (int i = 0; i < 16; i++) {
+        if (entry[i].name[0] == 0x00) break;
+        if (entry[i].attributes == 0x0F) continue;
+
+        if (entry[i].name[0] == 'T' && entry[i].name[1] == 'E' && entry[i].name[2] == 'S' && entry[i].name[3] == 'T') {
+            print_string("File found! Reading...\r\n");
+
+            unsigned int first_cluster = entry[i].low_cluster | (entry[i].high_cluster << 16);
+            unsigned int data_region_lba = bpb->reserved_sectors + (bpb->num_fats * bpb->fat_size_32);
+            unsigned int file_lba = data_region_lba + (first_cluster - 2) * bpb->sectors_per_cluster;
+
+            read_sector_ata(file_lba, file_buf);
+
+            print_string("Content:\r\n---\r\n");
+            unsigned int size = entry[i].file_size;
+            if (size > 200) size = 200;
+            for (unsigned int j = 0; j < size; j++) print_char(file_buf[j]);
+            print_string("\r\n---\r\n");
+            return;
+        }
+    }
+    print_string("TEST.TXT not found.\r\n");
 }
 
 void keyboard_handler() {
@@ -111,10 +159,8 @@ void keyboard_handler() {
             print_string("\r\n");
             cmd_buffer[cmd_length] = '\0';
             if (cmd_length > 0) {
-                if (is_help(cmd_buffer)) {
-                    print_string("Commands:\r\n  help\r\n  fat (check FAT32 volume)\r\n");
-                } else if (is_fat(cmd_buffer)) {
-                    check_fat32();
+                if (is_cat(cmd_buffer)) {
+                    read_file_cat();
                 } else {
                     print_string("Unknown command.\r\n");
                 }
@@ -131,8 +177,8 @@ void keyboard_handler() {
 }
 
 void main() {
-    print_string("DarkOS Terminal v0.8 (FAT32 Check)\r\n");
-    print_string("Type 'help' or 'fat'.\r\n> ");
+    print_string("DarkOS Terminal v1.1\r\n");
+    print_string("Type 'cat'.\r\n> ");
 
     init_idt();
     init_pic();
